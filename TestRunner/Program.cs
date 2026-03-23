@@ -1,7 +1,6 @@
 ﻿using MyTestingFramework;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -10,83 +9,66 @@ using System.Threading.Tasks;
 
 namespace TestRunner;
 
-class Program
+public class Program
 {
-    
     private static readonly object _consoleLock = new object();
 
-    
-    private static readonly int MaxDegreeOfParallelism = 4;
-
-    static async Task Main(string[] args)
+    static void Main(string[] args)
     {
-        Console.WriteLine("=== ЗАГРУЗКА ТЕСТОВ ===");
+        Console.WriteLine("=== ЛАБОРАТОРНАЯ РАБОТА 3: СОБСТВЕННЫЙ DYNAMIC THREAD POOL ===");
         string baseDir = AppContext.BaseDirectory;
         string dllPath = Path.Combine(baseDir, "TaskManagerSystem.Tests.dll");
 
         if (!File.Exists(dllPath)) { Console.WriteLine("DLL не найдена"); return; }
 
         Assembly asm = Assembly.LoadFrom(dllPath);
-        var jobs = PrepareTestJobs(asm);
+        var baseJobs = PrepareTestJobs(asm);
 
-        Console.WriteLine($"Найдено тестов для запуска: {jobs.Count}\n");
+        
+        var jobs = new List<TestJob>();
+        for (int i = 0; i < 15; i++) jobs.AddRange(baseJobs);
 
-       
-        Console.WriteLine("--- СЕКВЕНЦИАЛЬНЫЙ ЗАПУСК (1 поток) ---");
-        var swSeq = Stopwatch.StartNew();
-        foreach (var job in jobs)
+        Console.WriteLine($"Найдено/Сгенерировано тестов для запуска: {jobs.Count}\n");
+
+      
+        using var pool = new DynamicThreadPool(minThreads: 2, maxThreads: 10, idleTimeoutMs: 3000, hangTimeoutMs: 5000);
+
+        Console.WriteLine("--- СЦЕНАРИЙ 1: Единичные подачи ---");
+        for (int i = 0; i < 3; i++)
         {
-            await ExecuteJobAsync(job);
+            var job = jobs[i];
+            pool.Enqueue(() => ExecuteJob(job));
+            Thread.Sleep(800); 
         }
-        swSeq.Stop();
 
-        Console.WriteLine("\nОчистка консоли для параллельного запуска через 3 секунды...");
-        await Task.Delay(3000);
-        Console.Clear();
+        Console.WriteLine("\n--- СЦЕНАРИЙ 2: Период бездействия (наблюдаем адаптивное сжатие) ---");
+        Thread.Sleep(5000); 
 
+        Console.WriteLine("\n--- СЦЕНАРИЙ 3: Пиковая нагрузка (шквал задач) ---");
        
-        Console.WriteLine($"--- ПАРАЛЛЕЛЬНЫЙ ЗАПУСК (Макс. потоков: {MaxDegreeOfParallelism}) ---");
-        var swPar = Stopwatch.StartNew();
-        var semaphore = new SemaphoreSlim(MaxDegreeOfParallelism);
-
-        var parallelTasks = jobs.Select(async job =>
+        for (int i = 3; i < 43; i++)
         {
-            await semaphore.WaitAsync();
-            try
-            {
-                await ExecuteJobAsync(job);
-            }
-            finally
-            {
-                semaphore.Release();
-            }
-        });
+            var job = jobs[i];
+            pool.Enqueue(() => ExecuteJob(job));
+        }
 
-        await Task.WhenAll(parallelTasks);
-        swPar.Stop();
+        Console.WriteLine("\n--- СЦЕНАРИЙ 4: Добиваем оставшиеся тесты ---");
+        for (int i = 43; i < jobs.Count; i++)
+        {
+            var job = jobs[i];
+            pool.Enqueue(() => ExecuteJob(job));
+            Thread.Sleep(100);
+        }
 
        
+        while (!pool.IsIdle())
+        {
+            Thread.Sleep(500);
+        }
+
         Console.WriteLine("\n=============================================");
-        Console.WriteLine("ОТЧЕТ ОБ ЭФФЕКТИВНОСТИ:");
-        Console.WriteLine($"Последовательно: {swSeq.ElapsedMilliseconds} мс");
-        Console.WriteLine($"Параллельно:     {swPar.ElapsedMilliseconds} мс");
-
-        double speedup = (double)swSeq.ElapsedMilliseconds / swPar.ElapsedMilliseconds;
-        Console.WriteLine($"Ускорение в:     {Math.Round(speedup, 2)} раз(а)");
-        Console.WriteLine("=============================================");
+        Console.WriteLine("ВСЕ ТЕСТЫ ЗАВЕРШЕНЫ");
         Console.ReadLine();
-    }
-
-   
-    class TestJob
-    {
-        public Type TestType { get; set; } = null!;
-        public MethodInfo Method { get; set; } = null!;
-        public MethodInfo? SetupMethod { get; set; }
-        public MyTestAttribute Attr { get; set; } = null!;
-        public MyTimeoutAttribute? TimeoutAttr { get; set; }
-        public string Category { get; set; } = "General";
-        public object[]? Args { get; set; }
     }
 
    
@@ -128,9 +110,8 @@ class Program
     }
 
     
-    static async Task ExecuteJobAsync(TestJob job)
+    static void ExecuteJob(TestJob job)
     {
-        
         var instance = Activator.CreateInstance(job.TestType);
         job.SetupMethod?.Invoke(instance, null);
 
@@ -140,23 +121,21 @@ class Program
         try
         {
             
-            Task testExecution = typeof(Task).IsAssignableFrom(job.Method.ReturnType)
-                ? (Task)job.Method.Invoke(instance, job.Args)!
-                : Task.Run(() => job.Method.Invoke(instance, job.Args));
-
-           
-            if (job.TimeoutAttr != null)
+            if (typeof(Task).IsAssignableFrom(job.Method.ReturnType))
             {
-                var timeoutTask = Task.Delay(job.TimeoutAttr.Milliseconds);
-                var completedTask = await Task.WhenAny(testExecution, timeoutTask);
-
-                if (completedTask == timeoutTask)
-                {
-                    throw new TimeoutException($"Превышен лимит времени в {job.TimeoutAttr.Milliseconds} мс");
-                }
+                var task = (Task)job.Method.Invoke(instance, job.Args)!;
+                task.Wait(); 
+            }
+            else
+            {
+                job.Method.Invoke(instance, job.Args);
             }
 
-            await testExecution; 
+           
+            if (job.Method.Name.Contains("Delay") || job.Method.Name.Contains("Timeout"))
+            {
+                Thread.Sleep(6000);
+            }
 
             SafeConsoleWrite(ConsoleColor.Green, $"[PASS] [{job.Category}] {testName} [TID: {Thread.CurrentThread.ManagedThreadId}]");
         }
@@ -167,8 +146,7 @@ class Program
         }
     }
 
-   
-    static void SafeConsoleWrite(ConsoleColor color, string message)
+    public static void SafeConsoleWrite(ConsoleColor color, string message)
     {
         lock (_consoleLock)
         {
@@ -176,5 +154,16 @@ class Program
             Console.WriteLine(message);
             Console.ResetColor();
         }
+    }
+
+    class TestJob
+    {
+        public Type TestType { get; set; } = null!;
+        public MethodInfo Method { get; set; } = null!;
+        public MethodInfo? SetupMethod { get; set; }
+        public MyTestAttribute Attr { get; set; } = null!;
+        public MyTimeoutAttribute? TimeoutAttr { get; set; }
+        public string Category { get; set; } = "General";
+        public object[]? Args { get; set; }
     }
 }
